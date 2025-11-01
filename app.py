@@ -48,7 +48,7 @@ def logout():
     for k in ["user","role"]:
         if k in st.session_state:
             del st.session_state[k]
-    st.experimental_rerun()
+    st.rerun()
 
 # --------------------------------------------------------------------
 #  BUYER DASHBOARD
