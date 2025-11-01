@@ -91,7 +91,7 @@ def buyer_dashboard(user):
                     new_id = cur.fetchone()["id"]
                     conn.commit()
             st.success(f"Auction created with ID {new_id}")
-            st.experimental_rerun()
+            st.rerun()
 
         st.markdown("### Add Items to Existing Auction")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s",(user["id"],))
