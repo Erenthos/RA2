@@ -1,5 +1,6 @@
 """
 app.py — Reverse Auction Platform (Buyer/Supplier, Timed Auctions)
+Optimized for selective live refresh
 Compatible with Neon PostgreSQL + Streamlit Cloud
 
 Environment variable:
@@ -15,7 +16,7 @@ from psycopg2.extras import RealDictCursor
 # --------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------
-REFRESH_SEC = 3  # Auto-refresh every 3 seconds
+REFRESH_SEC = 3  # Live refresh rate (in seconds)
 NEON_ENV = "NEON_URL"
 
 # --------------------------------------------------------------------
@@ -157,9 +158,9 @@ def buyer_dashboard(user):
                         conn.commit()
                 st.success("Item added successfully!")
 
-    # ------------------------------------------------ Bids tab
+    # ------------------------------------------------ Bids tab (LIVE REFRESH)
     with tabs[2]:
-        st.subheader("View All Bids")
+        st.subheader("📊 View All Bids (Live)")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
         if aucs.empty:
             st.info("No auctions found.")
@@ -179,11 +180,17 @@ def buyer_dashboard(user):
             WHERE b.auction_id=%s
             ORDER BY ai.id, b.bid_amount ASC;
             """
-            df = run_query(q, (sel,))
-            if df.empty:
-                st.info("No bids yet.")
-            else:
-                st.dataframe(df, use_container_width=True)
+            st.markdown("🔄 **Auto-refreshing every 3 seconds...**")
+            placeholder = st.empty()
+            for _ in range(100):  # runs until manual tab change
+                df = run_query(q, (sel,))
+                if df.empty:
+                    placeholder.info("No bids yet.")
+                else:
+                    placeholder.dataframe(df, use_container_width=True)
+                time.sleep(REFRESH_SEC)
+                if st.session_state.get("role") != "buyer":
+                    break
 
 # --------------------------------------------------------------------
 # SUPPLIER DASHBOARD
@@ -209,7 +216,7 @@ def supplier_dashboard(user):
             df["time_left"] = pd.to_datetime(df["end_time"]) - datetime.datetime.utcnow()
             st.dataframe(df, use_container_width=True)
 
-    # ------------------------------------------------ Place bids
+    # ------------------------------------------------ Place bids (LIVE REFRESH)
     with tabs[1]:
         aucs = run_query("SELECT id,title FROM auctions WHERE status='live' AND end_time>NOW()")
         if aucs.empty:
@@ -229,30 +236,37 @@ def supplier_dashboard(user):
             WHERE ai.auction_id=%s
             ORDER BY ai.id;
             """
-            df = run_query(q, (sel,))
-            if df.empty:
-                st.info("No items found.")
-            else:
-                st.dataframe(df, use_container_width=True)
-                item = st.selectbox(
-                    "Select Item",
-                    df["id"],
-                    format_func=lambda x: df.loc[df["id"]==x,"item_name"].iloc[0],
-                    key="supplier_item_select"
-                )
-                amt = st.number_input("Your Bid Amount", min_value=0.0)
-                if st.button("Submit Bid"):
-                    q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
-                           VALUES(%s,%s,%s,%s)"""
-                    try:
-                        with get_conn() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute(q, (sel, item, user["id"], amt))
-                                conn.commit()
-                        st.success("Bid placed successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+            st.markdown("🔄 **Live Lowest Bids (auto-refresh every 3 sec)**")
+            placeholder = st.empty()
+            for _ in range(100):
+                df = run_query(q, (sel,))
+                if df.empty:
+                    placeholder.info("No items found.")
+                else:
+                    placeholder.dataframe(df, use_container_width=True)
+                time.sleep(REFRESH_SEC)
+                if st.session_state.get("role") != "supplier":
+                    break
+
+            item = st.selectbox(
+                "Select Item",
+                df["id"],
+                format_func=lambda x: df.loc[df["id"]==x,"item_name"].iloc[0],
+                key="supplier_item_select"
+            )
+            amt = st.number_input("Your Bid Amount", min_value=0.0)
+            if st.button("Submit Bid"):
+                q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
+                       VALUES(%s,%s,%s,%s)"""
+                try:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(q, (sel, item, user["id"], amt))
+                            conn.commit()
+                    st.success("Bid placed successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # --------------------------------------------------------------------
 # LOGIN + SIGNUP
@@ -303,12 +317,3 @@ else:
         buyer_dashboard(user)
     else:
         supplier_dashboard(user)
-
-# --------------------------------------------------------------------
-# AUTO REFRESH (3s)
-# --------------------------------------------------------------------
-if "last_refresh" not in st.session_state:
-    st.session_state["last_refresh"] = time.time()
-if time.time() - st.session_state["last_refresh"] > REFRESH_SEC:
-    st.session_state["last_refresh"] = time.time()
-    st.rerun()
