@@ -207,7 +207,7 @@ if "user" not in st.session_state:
         else:
             st.session_state["user"] = u
             st.session_state["role"] = u["role"]
-            st.experimental_rerun()
+            st.rerun()
 else:
     user = st.session_state["user"]
     st.sidebar.success(f"Logged in as {user['name']} ({user['role']})")
@@ -223,4 +223,4 @@ else:
 if "last_refresh" not in st.session_state: st.session_state["last_refresh"]=time.time()
 if time.time()-st.session_state["last_refresh"]>REFRESH_SEC:
     st.session_state["last_refresh"]=time.time()
-    st.experimental_rerun()
+    st.rerun()
