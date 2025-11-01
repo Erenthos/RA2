@@ -1,132 +1,226 @@
 """
-app.py
-Streamlit Reverse Auction (RA) Platform using Neon PostgreSQL as backend.
+app.py – Reverse Auction Platform (Multi-Item Version)
+Compatible with Neon PostgreSQL & Streamlit Cloud
 
-Usage:
-1. Add your Neon connection string as environment variable or Streamlit secret:
-   NEON_URL = "postgresql://user:password@host/dbname"
-2. Run locally: streamlit run app.py
-3. Or deploy on Streamlit Cloud (add NEON_URL under Secrets)
+Environment:
+    NEON_URL = "postgresql://user:password@host/dbname"
 """
 
-import os
-import time
-import datetime
+import os, time, datetime
 import streamlit as st
-import psycopg2
 import pandas as pd
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# ------------------- CONFIG -------------------
-REFRESH_SECONDS = 5
-NEON_ENV_VAR = "NEON_URL"
+# --------------------------------------------------------------------
+#  CONFIG
+# --------------------------------------------------------------------
+REFRESH_SEC = 8
+NEON_ENV = "NEON_URL"
 
-# ------------- DATABASE FUNCTIONS -------------
-def get_neon_url():
-    neon = os.getenv(NEON_ENV_VAR) or st.secrets.get(NEON_ENV_VAR, None)
-    if not neon:
-        st.error(f"Missing Neon connection string. Add {NEON_ENV_VAR} to Streamlit Secrets.")
-        st.stop()
-    return neon
-
+# --------------------------------------------------------------------
+#  DB helpers
+# --------------------------------------------------------------------
 def get_conn():
-    return psycopg2.connect(get_neon_url(), cursor_factory=RealDictCursor)
+    url = os.getenv(NEON_ENV) or st.secrets.get(NEON_ENV)
+    if not url:
+        st.error("Missing NEON_URL secret/env variable")
+        st.stop()
+    return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
-def fetch_auctions():
+def run_query(query, params=None, fetch=True):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM auctions ORDER BY id;")
-            rows = cur.fetchall()
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+            cur.execute(query, params or ())
+            if fetch:
+                rows = cur.fetchall()
+                return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-def fetch_bids(auction_id):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT bidder_name, bid_amount, bid_time FROM bids WHERE auction_id=%s ORDER BY bid_amount ASC, bid_time ASC;",
-                (auction_id,),
-            )
-            rows = cur.fetchall()
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+# --------------------------------------------------------------------
+#  AUTH
+# --------------------------------------------------------------------
+def authenticate(email, pwd):
+    q = "SELECT * FROM users WHERE email=%s AND password=%s"
+    df = run_query(q, (email, pwd))
+    return df.iloc[0].to_dict() if not df.empty else None
 
-def place_bid(auction_id, bidder_name, bid_amount):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT base_price FROM auctions WHERE id=%s;", (auction_id,))
-            base = cur.fetchone()
-            if not base:
-                return {"ok": False, "msg": "Auction not found."}
-            cur.execute(
-                "SELECT bid_amount FROM bids WHERE auction_id=%s ORDER BY bid_amount ASC LIMIT 1;",
-                (auction_id,),
-            )
-            lowest = cur.fetchone()
-            if lowest and bid_amount >= lowest["bid_amount"]:
-                return {"ok": False, "msg": f"Bid must be lower than current lowest ({lowest['bid_amount']})."}
-            if not lowest and bid_amount >= base["base_price"]:
-                return {"ok": False, "msg": f"First bid must be lower than base price ({base['base_price']})."}
-            cur.execute(
-                "INSERT INTO bids (auction_id, bidder_name, bid_amount, bid_time) VALUES (%s, %s, %s, NOW()) RETURNING id;",
-                (auction_id, bidder_name, bid_amount),
-            )
-            conn.commit()
-            return {"ok": True, "msg": "✅ Bid placed successfully!"}
+def logout():
+    for k in ["user","role"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.experimental_rerun()
 
-# ---------------- STREAMLIT UI ----------------
-st.set_page_config(page_title="Reverse Auction Platform", layout="wide")
-st.title("🔻 Reverse Auction — Streamlit + Neon PostgreSQL")
+# --------------------------------------------------------------------
+#  BUYER DASHBOARD
+# --------------------------------------------------------------------
+def buyer_dashboard(user):
+    st.title("👩‍💼 Buyer Dashboard")
+    st.markdown(f"**Welcome, {user['name']}** ({user['company_name']})")
 
-# Sidebar user info
-with st.sidebar:
-    st.subheader("👤 Your Info")
-    name = st.text_input("Your name", key="username")
-    refresh = st.slider("Auto-refresh (seconds)", 2, 30, REFRESH_SECONDS)
-    st.write("DB connection from NEON_URL secret.")
+    tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 Bids"])
 
-# Fetch auctions
-auctions = fetch_auctions()
-if auctions.empty:
-    st.warning("No auctions found in the database.")
-    st.stop()
+    # ------------------------------------------------ Auctions tab
+    with tabs[0]:
+        st.subheader("Your Auctions")
+        q = """
+        SELECT a.id, a.title, a.status, COUNT(ai.id) AS total_items,
+               COUNT(DISTINCT b.bidder_id) AS bidders
+        FROM auctions a
+        LEFT JOIN auction_items ai ON a.id=ai.auction_id
+        LEFT JOIN bids b ON a.id=b.auction_id
+        WHERE a.created_by=%s
+        GROUP BY a.id,a.title,a.status
+        ORDER BY a.id;
+        """
+        df = run_query(q,(user["id"],))
+        if df.empty: st.info("No auctions yet.")
+        else: st.dataframe(df, use_container_width=True)
 
-col1, col2 = st.columns([1, 2])
+    # ------------------------------------------------ Create Auction
+    with tabs[1]:
+        st.subheader("Create New Auction")
+        title = st.text_input("Auction Title")
+        desc = st.text_area("Description")
+        currency = st.selectbox("Currency", ["INR","USD","EUR"])
+        if st.button("Create Auction"):
+            q = """INSERT INTO auctions(title,description,currency,status,created_by)
+                   VALUES(%s,%s,%s,'live',%s) RETURNING id"""
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(q,(title,desc,currency,user["id"]))
+                    new_id = cur.fetchone()["id"]
+                    conn.commit()
+            st.success(f"Auction created with ID {new_id}")
+            st.experimental_rerun()
 
-with col1:
-    st.subheader("Available Auctions")
-    st.dataframe(auctions[["id", "title", "status", "base_price"]])
-    selected_id = st.selectbox("Select Auction ID", auctions["id"].tolist())
-    sel = auctions[auctions["id"] == selected_id].iloc[0]
-    st.markdown(f"### {sel['title']}")
-    st.caption(sel.get("description", ""))
-    st.write(f"Status: {sel['status']} | Base Price: {sel['base_price']}")
+        st.markdown("### Add Items to Existing Auction")
+        aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s",(user["id"],))
+        if not aucs.empty:
+            sel = st.selectbox("Select Auction", aucs["id"], format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}")
+            iname = st.text_input("Item Name")
+            idesc = st.text_input("Description")
+            qty = st.number_input("Quantity",min_value=0.01)
+            uom = st.text_input("UOM","Nos")
+            base = st.number_input("Base Price",min_value=0.0)
+            if st.button("Add Item"):
+                q = """INSERT INTO auction_items(auction_id,item_name,description,quantity,uom,base_price)
+                       VALUES(%s,%s,%s,%s,%s,%s)"""
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(q,(sel,iname,idesc,qty,uom,base))
+                        conn.commit()
+                st.success("Item added successfully!")
 
-with col2:
-    st.subheader("Live Bids")
-    bids = fetch_bids(selected_id)
-    if not bids.empty:
-        st.metric("Current Lowest Bid", f"{bids.iloc[0]['bid_amount']}")
-        st.table(bids)
-    else:
-        st.info("No bids yet.")
-
-    st.markdown("---")
-    st.subheader("Place a Bid")
-    bid_value = st.number_input("Bid amount", min_value=0.0, step=0.01)
-    if st.button("Submit Bid"):
-        if not name:
-            st.warning("Enter your name first.")
+    # ------------------------------------------------ Bids tab
+    with tabs[2]:
+        st.subheader("View Bids (All Suppliers)")
+        aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s",(user["id"],))
+        if aucs.empty:
+            st.info("No auctions yet.")
         else:
-            result = place_bid(selected_id, name, float(bid_value))
-            if result["ok"]:
-                st.success(result["msg"])
-                st.experimental_rerun()
+            sel = st.selectbox("Select Auction", aucs["id"], format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0])
+            q = """
+            SELECT ai.item_name, ai.quantity, ai.uom,
+                   b.bid_amount, b.bid_time, u.company_name
+            FROM bids b
+            JOIN auction_items ai ON b.item_id=ai.id
+            JOIN users u ON b.bidder_id=u.id
+            WHERE b.auction_id=%s
+            ORDER BY ai.id,b.bid_amount ASC;
+            """
+            df = run_query(q,(sel,))
+            if df.empty: st.info("No bids yet.")
+            else: st.dataframe(df,use_container_width=True)
+
+# --------------------------------------------------------------------
+#  SUPPLIER DASHBOARD
+# --------------------------------------------------------------------
+def supplier_dashboard(user):
+    st.title("🏭 Supplier Dashboard")
+    st.markdown(f"**Welcome, {user['company_name']}**")
+    tabs = st.tabs(["🔎 Live Auctions","💰 Place Bids"])
+
+    # ------------------------------------------------ Live auctions
+    with tabs[0]:
+        q = """
+        SELECT a.id,a.title,a.currency,COUNT(ai.id) AS items
+        FROM auctions a
+        JOIN auction_items ai ON a.id=ai.auction_id
+        WHERE a.status='live'
+        GROUP BY a.id,a.title,a.currency;
+        """
+        df = run_query(q)
+        if df.empty: st.info("No live auctions right now.")
+        else: st.dataframe(df,use_container_width=True)
+
+    # ------------------------------------------------ Place bids
+    with tabs[1]:
+        aucs = run_query("SELECT id,title FROM auctions WHERE status='live'")
+        if aucs.empty:
+            st.info("No active auctions.")
+        else:
+            sel = st.selectbox("Select Auction", aucs["id"],
+                               format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0])
+            q = """
+            SELECT ai.id, ai.item_name, ai.quantity, ai.uom, ai.base_price,
+                   v.lowest_bid
+            FROM auction_items ai
+            LEFT JOIN v_lowest_bids_per_item v ON ai.id=v.item_id
+            WHERE ai.auction_id=%s
+            ORDER BY ai.id;
+            """
+            df = run_query(q,(sel,))
+            if df.empty:
+                st.info("No items found.")
             else:
-                st.error(result["msg"])
+                st.dataframe(df,use_container_width=True)
 
-st.caption(f"Auto-refresh every {refresh} seconds | {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                item = st.selectbox("Select Item", df["id"],
+                                    format_func=lambda x: df.loc[df["id"]==x,"item_name"].iloc[0])
+                amt = st.number_input("Your Bid Amount",min_value=0.0)
+                if st.button("Submit Bid"):
+                    q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
+                           VALUES(%s,%s,%s,%s)"""
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(q,(sel,item,user["id"],amt))
+                                conn.commit()
+                        st.success("Bid placed successfully!")
+                        st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Error placing bid: {e}")
 
-if "last_refresh" not in st.session_state:
-    st.session_state["last_refresh"] = time.time()
-if time.time() - st.session_state["last_refresh"] > refresh:
-    st.session_state["last_refresh"] = time.time()
+# --------------------------------------------------------------------
+#  MAIN
+# --------------------------------------------------------------------
+st.set_page_config(page_title="Reverse Auction Platform", layout="wide")
+
+if "user" not in st.session_state:
+    st.title("🔐 Login")
+    email = st.text_input("Email")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login"):
+        u = authenticate(email,pwd)
+        if not u:
+            st.error("Invalid credentials")
+        else:
+            st.session_state["user"] = u
+            st.session_state["role"] = u["role"]
+            st.experimental_rerun()
+else:
+    user = st.session_state["user"]
+    st.sidebar.success(f"Logged in as {user['name']} ({user['role']})")
+    if st.sidebar.button("Logout"):
+        logout()
+
+    if user["role"] == "buyer":
+        buyer_dashboard(user)
+    else:
+        supplier_dashboard(user)
+
+# periodic refresh
+if "last_refresh" not in st.session_state: st.session_state["last_refresh"]=time.time()
+if time.time()-st.session_state["last_refresh"]>REFRESH_SEC:
+    st.session_state["last_refresh"]=time.time()
     st.experimental_rerun()
