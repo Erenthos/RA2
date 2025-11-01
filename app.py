@@ -15,7 +15,7 @@ from psycopg2.extras import RealDictCursor
 # --------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------
-REFRESH_SEC = 3
+REFRESH_SEC = 3  # Auto-refresh every 3 seconds
 NEON_ENV = "NEON_URL"
 
 # --------------------------------------------------------------------
@@ -85,8 +85,12 @@ def buyer_dashboard(user):
         st.markdown("### Manage Auction Status")
         aucs = run_query("SELECT id,title,status FROM auctions WHERE created_by=%s", (user["id"],))
         if not aucs.empty:
-            sel = st.selectbox("Select Auction", aucs["id"],
-                               format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}")
+            sel = st.selectbox(
+                "Select Auction (Manage)",
+                aucs["id"],
+                format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}",
+                key="manage_auction_select"
+            )
             current_status = aucs.loc[aucs["id"] == sel, "status"].iloc[0]
             st.write(f"Current status: **{current_status}**")
 
@@ -133,8 +137,12 @@ def buyer_dashboard(user):
         st.markdown("### Add Items to Auction")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
         if not aucs.empty:
-            sel = st.selectbox("Select Auction", aucs["id"],
-                               format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}")
+            sel = st.selectbox(
+                "Select Auction (Add Items)",
+                aucs["id"],
+                format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}",
+                key="add_item_select"
+            )
             iname = st.text_input("Item Name")
             idesc = st.text_input("Description")
             qty = st.number_input("Quantity", min_value=0.01)
@@ -156,8 +164,12 @@ def buyer_dashboard(user):
         if aucs.empty:
             st.info("No auctions found.")
         else:
-            sel = st.selectbox("Select Auction", aucs["id"],
-                               format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0])
+            sel = st.selectbox(
+                "Select Auction (View Bids)",
+                aucs["id"],
+                format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+                key="view_bids_select"
+            )
             q = """
             SELECT ai.item_name, ai.quantity, ai.uom,
                    b.bid_amount, b.bid_time, u.company_name
@@ -203,8 +215,12 @@ def supplier_dashboard(user):
         if aucs.empty:
             st.info("No active auctions.")
         else:
-            sel = st.selectbox("Select Auction", aucs["id"],
-                               format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0])
+            sel = st.selectbox(
+                "Select Auction (Bid)",
+                aucs["id"],
+                format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+                key="supplier_bid_select"
+            )
             q = """
             SELECT ai.id, ai.item_name, ai.quantity, ai.uom, ai.base_price,
                    v.lowest_bid
@@ -218,8 +234,12 @@ def supplier_dashboard(user):
                 st.info("No items found.")
             else:
                 st.dataframe(df, use_container_width=True)
-                item = st.selectbox("Select Item", df["id"],
-                                    format_func=lambda x: df.loc[df["id"]==x,"item_name"].iloc[0])
+                item = st.selectbox(
+                    "Select Item",
+                    df["id"],
+                    format_func=lambda x: df.loc[df["id"]==x,"item_name"].iloc[0],
+                    key="supplier_item_select"
+                )
                 amt = st.number_input("Your Bid Amount", min_value=0.0)
                 if st.button("Submit Bid"):
                     q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
@@ -284,7 +304,9 @@ else:
     else:
         supplier_dashboard(user)
 
-# periodic refresh
+# --------------------------------------------------------------------
+# AUTO REFRESH (3s)
+# --------------------------------------------------------------------
 if "last_refresh" not in st.session_state:
     st.session_state["last_refresh"] = time.time()
 if time.time() - st.session_state["last_refresh"] > REFRESH_SEC:
