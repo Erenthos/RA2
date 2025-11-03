@@ -1,7 +1,8 @@
 """
-app.py — Reverse Auction Platform (Buyer/Supplier, Timed Auctions)
-Optimized for selective live refresh
-Compatible with Neon PostgreSQL + Streamlit Cloud
+Reverse Auction Platform (Buyer & Supplier)
+--------------------------------------------
+Streamlit + Neon PostgreSQL
+Final Version: Live selective refresh + decrement validation + clean UI
 
 Environment variable:
     NEON_URL = "postgresql://user:password@your-neon-host/dbname"
@@ -16,7 +17,7 @@ from psycopg2.extras import RealDictCursor
 # --------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------
-REFRESH_SEC = 3  # Live refresh rate (in seconds)
+REFRESH_SEC = 3  # selective refresh interval
 NEON_ENV = "NEON_URL"
 
 # --------------------------------------------------------------------
@@ -25,7 +26,7 @@ NEON_ENV = "NEON_URL"
 def get_conn():
     url = os.getenv(NEON_ENV) or st.secrets.get(NEON_ENV)
     if not url:
-        st.error("Missing NEON_URL secret/env variable")
+        st.error("❌ Missing NEON_URL secret/environment variable")
         st.stop()
     return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
@@ -55,10 +56,11 @@ def logout():
 # BUYER DASHBOARD
 # --------------------------------------------------------------------
 def buyer_dashboard(user):
+    company_clean = user["company_name"].replace("Pvt Ltd", "").replace("Private Limited", "").replace("Ltd", "").strip()
     st.title("👩‍💼 Buyer Dashboard")
-    st.markdown(f"**Welcome, {user['name']}** ({user['company_name']})")
+    st.markdown(f"**Welcome, {user['name']}** ({company_clean})")
 
-    tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 Bids"])
+    tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 View Bids"])
 
     # ------------------------------------------------ Auctions tab
     with tabs[0]:
@@ -67,13 +69,14 @@ def buyer_dashboard(user):
         SELECT a.id, a.title, a.status,
                TO_CHAR(a.start_time, 'YYYY-MM-DD HH24:MI') AS start_time,
                TO_CHAR(a.end_time, 'YYYY-MM-DD HH24:MI') AS end_time,
+               a.min_decrement,
                COUNT(ai.id) AS total_items,
                COUNT(DISTINCT b.bidder_id) AS bidders
         FROM auctions a
         LEFT JOIN auction_items ai ON a.id=ai.auction_id
         LEFT JOIN bids b ON a.id=b.auction_id
         WHERE a.created_by=%s
-        GROUP BY a.id,a.title,a.status,a.start_time,a.end_time
+        GROUP BY a.id,a.title,a.status,a.start_time,a.end_time,a.min_decrement
         ORDER BY a.id;
         """
         df = run_query(q, (user["id"],))
@@ -82,7 +85,7 @@ def buyer_dashboard(user):
         else:
             st.dataframe(df, use_container_width=True)
 
-        # Control section
+        # Auction controls
         st.markdown("### Manage Auction Status")
         aucs = run_query("SELECT id,title,status FROM auctions WHERE created_by=%s", (user["id"],))
         if not aucs.empty:
@@ -106,13 +109,12 @@ def buyer_dashboard(user):
                     WHERE id=%s
                     """
                     run_query(q, (sel,), fetch=False)
-                    st.success("Auction started for 10 minutes.")
+                    st.success("Auction started (10 minutes).")
                     st.rerun()
 
             with col2:
                 if st.button("⏹️ Close Auction"):
-                    q = "UPDATE auctions SET status='closed' WHERE id=%s"
-                    run_query(q, (sel,), fetch=False)
+                    run_query("UPDATE auctions SET status='closed' WHERE id=%s", (sel,), fetch=False)
                     st.warning("Auction closed.")
                     st.rerun()
 
@@ -123,16 +125,20 @@ def buyer_dashboard(user):
         desc = st.text_area("Description")
         currency = st.selectbox("Currency", ["INR", "USD", "EUR"])
         duration = st.number_input("Default Duration (minutes)", min_value=1, max_value=120, value=10)
+        min_dec = st.number_input("Minimum Bid Decrement (X)", min_value=0.0, value=0.0, step=0.01,
+                                  help="Suppliers must bid in multiples of this decrement.")
         if st.button("Create Auction"):
-            q = """INSERT INTO auctions(title,description,currency,status,created_by,start_time,end_time)
-                   VALUES(%s,%s,%s,'scheduled',%s,NOW(),NOW() + INTERVAL '%s minutes')
-                   RETURNING id"""
+            q = """
+                INSERT INTO auctions(title, description, currency, status, created_by, start_time, end_time, min_decrement)
+                VALUES (%s, %s, %s, 'scheduled', %s, NOW(), NOW() + (%s || ' minutes')::interval, %s)
+                RETURNING id
+            """
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(q % duration, (title, desc, currency, user["id"]))
+                    cur.execute(q, (title, desc, currency, user["id"], str(duration), min_dec))
                     new_id = cur.fetchone()["id"]
                     conn.commit()
-            st.success(f"Auction created (ID: {new_id}) — starts as 'scheduled'")
+            st.success(f"Auction created (ID: {new_id}) — status: scheduled")
             st.rerun()
 
         st.markdown("### Add Items to Auction")
@@ -158,7 +164,7 @@ def buyer_dashboard(user):
                         conn.commit()
                 st.success("Item added successfully!")
 
-    # ------------------------------------------------ Bids tab (LIVE REFRESH)
+    # ------------------------------------------------ View Bids (LIVE)
     with tabs[2]:
         st.subheader("📊 View All Bids (Live)")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
@@ -180,9 +186,9 @@ def buyer_dashboard(user):
             WHERE b.auction_id=%s
             ORDER BY ai.id, b.bid_amount ASC;
             """
-            st.markdown("🔄 **Auto-refreshing every 3 seconds...**")
+            st.markdown("🔄 **Live Refresh Every 3 Seconds**")
             placeholder = st.empty()
-            for _ in range(100):  # runs until manual tab change
+            for _ in range(100):
                 df = run_query(q, (sel,))
                 if df.empty:
                     placeholder.info("No bids yet.")
@@ -196,8 +202,9 @@ def buyer_dashboard(user):
 # SUPPLIER DASHBOARD
 # --------------------------------------------------------------------
 def supplier_dashboard(user):
+    company_clean = user["company_name"].replace("Pvt Ltd", "").replace("Private Limited", "").replace("Ltd", "").strip()
     st.title("🏭 Supplier Dashboard")
-    st.markdown(f"**Welcome, {user['company_name']}**")
+    st.markdown(f"**Welcome, {company_clean}**")
     tabs = st.tabs(["🔎 Live Auctions", "💰 Place Bids"])
 
     # ------------------------------------------------ Live auctions
@@ -216,7 +223,7 @@ def supplier_dashboard(user):
             df["time_left"] = pd.to_datetime(df["end_time"]) - datetime.datetime.utcnow()
             st.dataframe(df, use_container_width=True)
 
-    # ------------------------------------------------ Place bids (LIVE REFRESH)
+    # ------------------------------------------------ Place bids (LIVE)
     with tabs[1]:
         aucs = run_query("SELECT id,title FROM auctions WHERE status='live' AND end_time>NOW()")
         if aucs.empty:
@@ -236,7 +243,7 @@ def supplier_dashboard(user):
             WHERE ai.auction_id=%s
             ORDER BY ai.id;
             """
-            st.markdown("🔄 **Live Lowest Bids (auto-refresh every 3 sec)**")
+            st.markdown("🔄 **Live Lowest Bids (3s refresh)**")
             placeholder = st.empty()
             for _ in range(100):
                 df = run_query(q, (sel,))
@@ -256,17 +263,36 @@ def supplier_dashboard(user):
             )
             amt = st.number_input("Your Bid Amount", min_value=0.0)
             if st.button("Submit Bid"):
-                q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
-                       VALUES(%s,%s,%s,%s)"""
-                try:
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(q, (sel, item, user["id"], amt))
-                            conn.commit()
-                    st.success("Bid placed successfully!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                # Check decrement rule
+                q_dec = "SELECT min_decrement FROM auctions WHERE id=%s"
+                dec_df = run_query(q_dec, (sel,))
+                min_dec = float(dec_df.iloc[0]["min_decrement"]) if not dec_df.empty else 0.0
+
+                q_low = "SELECT MIN(bid_amount) AS lowest FROM bids WHERE item_id=%s"
+                low_df = run_query(q_low, (item,))
+                current_lowest = float(low_df.iloc[0]["lowest"]) if not low_df.empty and low_df.iloc[0]["lowest"] else None
+
+                valid = True
+                if current_lowest:
+                    if amt >= current_lowest:
+                        st.error(f"Bid must be lower than current lowest ({current_lowest:.2f}).")
+                        valid = False
+                    elif min_dec > 0 and abs(current_lowest - amt) % min_dec != 0:
+                        st.error(f"Bid must decrease in multiples of {min_dec}. Adjust your amount.")
+                        valid = False
+
+                if valid:
+                    q = """INSERT INTO bids(auction_id,item_id,bidder_id,bid_amount)
+                           VALUES(%s,%s,%s,%s)"""
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(q, (sel, item, user["id"], amt))
+                                conn.commit()
+                        st.success("✅ Bid placed successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
 # --------------------------------------------------------------------
 # LOGIN + SIGNUP
