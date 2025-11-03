@@ -314,10 +314,11 @@ def supplier_dashboard(user):
             FROM auctions a
             JOIN auction_items ai ON a.id = ai.auction_id
             WHERE a.status = 'live'
-              AND a.end_time > NOW() - INTERVAL '1 minute'
+            AND (a.end_time AT TIME ZONE 'UTC') > NOW() - INTERVAL '1 minute'
             GROUP BY a.id, a.title, a.currency, a.end_time
             ORDER BY a.id;
             """
+
             df = run_query(q)
             if df.empty:
                 placeholder.info("No live auctions right now.")
@@ -332,12 +333,13 @@ def supplier_dashboard(user):
     with tabs[1]:
         st.subheader("Place Your Bids")
         aucs = run_query("""
-            SELECT a.id, a.title
-            FROM auctions a
-            WHERE a.status = 'live'
-              AND a.end_time > NOW() - INTERVAL '1 minute'
-            ORDER BY a.id;
+        SELECT a.id, a.title
+        FROM auctions a
+        WHERE a.status = 'live'
+        AND (a.end_time AT TIME ZONE 'UTC') > NOW() - INTERVAL '1 minute'
+        ORDER BY a.id;
         """)
+
         if aucs.empty:
             st.warning("No active auctions available for bidding.")
             dbg = run_query("""
