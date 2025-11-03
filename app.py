@@ -3,10 +3,10 @@ Reverse Auction Platform — Final Stable Build
 Streamlit + Neon PostgreSQL
 -----------------------------------------------
 ✅ Buyer & Supplier roles
-✅ Bulk bidding
 ✅ Buyer-defined auction duration (frozen once started)
-✅ Live updates without logout
 ✅ Auto-close expired auctions
+✅ Live updates without logout
+✅ Buyer-only PDF Summary Report
 Requires NEON_URL in secrets.
 """
 
@@ -17,6 +17,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from fpdf import FPDF   # For PDF summary
 
 # ---------------- CONFIG ----------------
 REFRESH_SEC = 3
@@ -31,7 +32,6 @@ def get_conn():
     return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
 def run_query(query, params=None, fetch=True):
-    """Run SQL safely and return pandas DataFrame."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params or ())
@@ -92,7 +92,7 @@ def buyer_dashboard(user):
     st.title("👩‍💼 Buyer Dashboard")
     st.markdown(f"**Welcome, {user['name']}** ({company_clean})")
 
-    tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 View Bids"])
+    tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 View Bids", "📄 Download Summary"])
 
     # ---------- Auctions Tab ----------
     with tabs[0]:
@@ -230,6 +230,73 @@ def buyer_dashboard(user):
                 if st.session_state.get("role") != "buyer":
                     break
 
+    # ---------- Buyer-only PDF Summary ----------
+    with tabs[3]:
+        st.subheader("📄 Download Auction Summary Report")
+
+        aucs = run_query("SELECT id,title FROM auctions WHERE status='closed' AND created_by=%s ORDER BY id DESC", (user["id"],))
+        if aucs.empty:
+            st.info("No closed auctions available.")
+            return
+
+        sel = st.selectbox(
+            "Select Closed Auction",
+            aucs["id"],
+            format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+            key="summary_select"
+        )
+
+        q = """
+        SELECT ai.item_name, ai.quantity, ai.uom,
+               MIN(b.bid_amount) AS lowest_bid,
+               u.company_name AS winner
+        FROM bids b
+        JOIN auction_items ai ON b.item_id=ai.id
+        JOIN users u ON b.bidder_id=u.id
+        WHERE b.auction_id=%s
+        GROUP BY ai.item_name, ai.quantity, ai.uom, u.company_name, b.item_id
+        ORDER BY ai.item_name;
+        """
+        df = run_query(q, (sel,))
+        if df.empty:
+            st.warning("No bid data available for this auction.")
+            return
+
+        st.dataframe(df, use_container_width=True)
+
+        if st.button("⬇️ Download Summary as PDF", key=f"pdf_{sel}"):
+            title = aucs.loc[aucs["id"]==sel,"title"].iloc[0]
+            timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, f"Auction Summary Report - {title}", ln=True, align="C")
+            pdf.ln(5)
+            pdf.set_font("Arial", "", 11)
+            pdf.cell(0, 10, f"Generated on {timestamp}", ln=True)
+
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(60, 10, "Item", 1)
+            pdf.cell(25, 10, "Qty", 1)
+            pdf.cell(20, 10, "UOM", 1)
+            pdf.cell(30, 10, "Lowest Bid", 1)
+            pdf.cell(55, 10, "Winner", 1)
+            pdf.ln()
+
+            pdf.set_font("Arial", "", 11)
+            for _, r in df.iterrows():
+                pdf.cell(60, 10, str(r["item_name"]), 1)
+                pdf.cell(25, 10, str(r["quantity"]), 1)
+                pdf.cell(20, 10, str(r["uom"]), 1)
+                pdf.cell(30, 10, str(r["lowest_bid"]), 1)
+                pdf.cell(55, 10, str(r["winner"]), 1)
+                pdf.ln()
+
+            pdf_output = f"auction_summary_{sel}.pdf"
+            pdf.output(pdf_output)
+            with open(pdf_output, "rb") as f:
+                st.download_button("📥 Click to Download PDF", f, file_name=pdf_output, mime="application/pdf")
+
 # ---------------- SUPPLIER DASHBOARD ----------------
 def supplier_dashboard(user):
     auto_close_expired()
@@ -249,7 +316,7 @@ def supplier_dashboard(user):
             FROM auctions a
             JOIN auction_items ai ON a.id=ai.auction_id
             WHERE a.status='live'
-              AND a.end_time > NOW() - INTERVAL '1 minute'
+              AND a.end_time > (NOW() AT TIME ZONE 'UTC' - INTERVAL '1 minute')
             GROUP BY a.id,a.title,a.currency,a.end_time
             ORDER BY a.id;
             """
@@ -265,15 +332,24 @@ def supplier_dashboard(user):
 
     # ---------- Place Bids ----------
     with tabs[1]:
+        st.subheader("Place Your Bids")
+
         aucs = run_query("""
-            SELECT a.id,a.title
+            SELECT a.id, a.title
             FROM auctions a
             WHERE a.status='live'
-              AND a.end_time > NOW() - INTERVAL '1 minute'
+              AND a.end_time > (NOW() AT TIME ZONE 'UTC' - INTERVAL '1 minute')
             ORDER BY a.id;
         """)
+
         if aucs.empty:
             st.warning("No active auctions available for bidding.")
+            dbg = run_query("""
+                SELECT id, title, status, end_time, NOW() AT TIME ZONE 'UTC' AS server_time
+                FROM auctions ORDER BY id DESC LIMIT 5;
+            """)
+            st.caption("🔍 Debug view of last 5 auctions:")
+            st.dataframe(dbg, use_container_width=True)
             return
 
         sel = st.selectbox(
