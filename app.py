@@ -146,12 +146,12 @@ def buyer_dashboard(user):
                         st.error("Failed to start auction.")
                     else:
                         st.success("Auction started for 10 minutes.")
-                        st.experimental_rerun()
+                        st.rerun()
             with col2:
                 if status == "live" and st.button("⏹️ Close Auction", key=f"close_{sel}"):
                     run_query("UPDATE auctions SET status='closed' WHERE id=%s", (sel,), fetch=False)
                     st.warning("Auction closed manually.")
-                    st.experimental_rerun()
+                    st.rerun()
             if status == "live":
                 end = row["end_time"]
                 st.info(f"⏳ This auction will auto-close at: **{end}**")
@@ -175,7 +175,7 @@ def buyer_dashboard(user):
                 st.error("Failed to create auction.")
             else:
                 st.success(f"Auction created with ID {df.iloc[0]['id']}. Add items below.")
-                st.experimental_rerun()
+                st.rerun()
 
         st.markdown("### Add Items")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s AND status='scheduled'", (user["id"],))
@@ -363,7 +363,7 @@ def supplier_dashboard(user):
                             conn.commit()
                     st.success(f"{len(bids)} bids submitted successfully.")
                     st.session_state["bulk_edits"][sel] = {}
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"DB Error: {e}")
             else:
@@ -384,7 +384,7 @@ if "user" not in st.session_state:
             else:
                 st.session_state["user"] = u
                 st.session_state["role"] = u["role"]
-                st.experimental_rerun()
+                st.rerun()
     with tab2:
         name = st.text_input("Full Name", key="signup_name")
         email = st.text_input("Email Address", key="signup_email")
