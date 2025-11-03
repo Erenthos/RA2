@@ -1,19 +1,18 @@
 """
-Reverse Auction Platform — Final Stable Release
+Reverse Auction Platform — Final Stable Build
 Streamlit + Neon PostgreSQL
 -----------------------------------------------
 ✅ Buyer & Supplier roles
 ✅ Bulk bidding
+✅ Buyer-defined auction duration (frozen once started)
 ✅ Live updates without logout
 ✅ Auto-close expired auctions
-✅ Duration frozen after start
 Requires NEON_URL in secrets.
 """
 
 import os
 import time
 import datetime
-import math
 import streamlit as st
 import pandas as pd
 import psycopg2
@@ -32,6 +31,7 @@ def get_conn():
     return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
 def run_query(query, params=None, fetch=True):
+    """Run SQL safely and return pandas DataFrame."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params or ())
@@ -87,7 +87,7 @@ def auto_close_expired():
 
 # ---------------- BUYER DASHBOARD ----------------
 def buyer_dashboard(user):
-    auto_close_expired()  # housekeeping on load
+    auto_close_expired()
     company_clean = clean_company(user.get("company_name", ""))
     st.title("👩‍💼 Buyer Dashboard")
     st.markdown(f"**Welcome, {user['name']}** ({company_clean})")
@@ -130,22 +130,21 @@ def buyer_dashboard(user):
             status = row["status"]
             st.write(f"**Current Status:** {status}")
 
-            # Allow start/close only if not already live/closed
             col1, col2 = st.columns(2)
             with col1:
                 if status == "scheduled" and st.button("▶️ Start Auction Now", key=f"start_{sel}"):
                     q = """
                     UPDATE auctions
                     SET status='live',
-                        start_time=NOW(),
-                        end_time=NOW() + make_interval(mins := 10)
-                    WHERE id=%s RETURNING id;
+                        start_time=NOW()
+                    WHERE id=%s RETURNING end_time;
                     """
                     res = run_query(q, (sel,))
                     if res.empty:
                         st.error("Failed to start auction.")
                     else:
-                        st.success("Auction started for 10 minutes.")
+                        end_time = res.iloc[0]["end_time"]
+                        st.success(f"Auction started. It will auto-close at {end_time}.")
                         st.rerun()
             with col2:
                 if status == "live" and st.button("⏹️ Close Auction", key=f"close_{sel}"):
@@ -153,8 +152,7 @@ def buyer_dashboard(user):
                     st.warning("Auction closed manually.")
                     st.rerun()
             if status == "live":
-                end = row["end_time"]
-                st.info(f"⏳ This auction will auto-close at: **{end}**")
+                st.info(f"⏳ This auction will auto-close at: {row['end_time']}")
 
     # ---------- Create Auction ----------
     with tabs[1]:
@@ -162,7 +160,7 @@ def buyer_dashboard(user):
         title = st.text_input("Auction Title", key="new_title")
         desc = st.text_area("Description", key="new_desc")
         currency = st.selectbox("Currency", ["INR", "USD", "EUR"], key="new_curr")
-        duration = st.number_input("Default Duration (minutes)", min_value=1, max_value=1440, value=10, key="new_dur")
+        duration = st.number_input("Auction Duration (minutes)", min_value=1, max_value=1440, value=10, key="new_dur")
         min_dec = st.number_input("Minimum Bid Decrement (X)", min_value=0.0, value=0.0, key="new_dec")
         if st.button("Create Auction", key="create_btn"):
             q = """
@@ -174,10 +172,10 @@ def buyer_dashboard(user):
             if df.empty:
                 st.error("Failed to create auction.")
             else:
-                st.success(f"Auction created with ID {df.iloc[0]['id']}. Add items below.")
+                st.success(f"Auction created with ID {df.iloc[0]['id']} (duration: {duration} min). Add items below.")
                 st.rerun()
 
-        st.markdown("### Add Items")
+        st.markdown("### Add Items to Auction")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s AND status='scheduled'", (user["id"],))
         if aucs.empty:
             st.info("Only scheduled auctions can accept new items.")
@@ -193,13 +191,13 @@ def buyer_dashboard(user):
             qty = st.number_input("Quantity", min_value=1.0, key="itm_qty")
             uom = st.text_input("UOM", "Nos", key="itm_uom")
             base = st.number_input("Base Price", min_value=0.0, key="itm_base")
-            if st.button("Add Item", key="add_btn"):
+            if st.button("Add Item", key="itm_add_btn"):
                 q = """INSERT INTO auction_items(auction_id,item_name,description,quantity,uom,base_price)
                        VALUES(%s,%s,%s,%s,%s,%s)"""
                 run_query(q, (sel, iname, idesc, qty, uom, base), fetch=False)
                 st.success("Item added successfully!")
 
-    # ---------- Live Bid View ----------
+    # ---------- View Bids ----------
     with tabs[2]:
         st.subheader("📊 Live Bids")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
@@ -251,7 +249,7 @@ def supplier_dashboard(user):
             FROM auctions a
             JOIN auction_items ai ON a.id=ai.auction_id
             WHERE a.status='live'
-              AND a.end_time > (NOW() AT TIME ZONE 'UTC' - INTERVAL '1 minute')
+              AND a.end_time > NOW() - INTERVAL '1 minute'
             GROUP BY a.id,a.title,a.currency,a.end_time
             ORDER BY a.id;
             """
@@ -267,10 +265,17 @@ def supplier_dashboard(user):
 
     # ---------- Place Bids ----------
     with tabs[1]:
-        aucs = run_query("SELECT id,title FROM auctions WHERE status='live' AND end_time>(NOW() AT TIME ZONE 'UTC')")
+        aucs = run_query("""
+            SELECT a.id,a.title
+            FROM auctions a
+            WHERE a.status='live'
+              AND a.end_time > NOW() - INTERVAL '1 minute'
+            ORDER BY a.id;
+        """)
         if aucs.empty:
-            st.info("No active auctions.")
+            st.warning("No active auctions available for bidding.")
             return
+
         sel = st.selectbox(
             "Select Auction",
             aucs["id"],
@@ -305,22 +310,11 @@ def supplier_dashboard(user):
 
         edited = st.data_editor(
             df[["id","item_name","quantity","uom","base_price","lowest_bid","your_bid","select"]],
-            column_config={
-                "id": st.column_config.HiddenColumn("id"),
-                "item_name": st.column_config.TextColumn("Item", disabled=True),
-                "quantity": st.column_config.NumberColumn("Qty", disabled=True),
-                "uom": st.column_config.TextColumn("UOM", disabled=True),
-                "base_price": st.column_config.NumberColumn("Base", disabled=True),
-                "lowest_bid": st.column_config.NumberColumn("Lowest", disabled=True),
-                "your_bid": st.column_config.NumberColumn("Your Bid"),
-                "select": st.column_config.CheckboxColumn("Select"),
-            },
             use_container_width=True,
             num_rows="dynamic",
             key=f"edit_{sel}",
         )
 
-        # persist edits
         new_edits = {}
         for _, r in edited.iterrows():
             iid = int(r["id"])
