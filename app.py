@@ -1,11 +1,12 @@
 """
-Reverse Auction Platform — Final Stable Version
+Reverse Auction Platform — Final Stable Release
+Streamlit + Neon PostgreSQL
 -----------------------------------------------
-✅ Buyer & Supplier Login
-✅ Buyer creates/starts auctions (with min decrement)
-✅ Suppliers submit bids for multiple items in bulk
-✅ Live data refresh without logout
-✅ Fix for 'No live auctions' issue (timezone-safe)
+✅ Buyer & Supplier roles
+✅ Bulk bidding
+✅ Live updates without logout
+✅ Auto-close expired auctions
+✅ Duration frozen after start
 Requires NEON_URL in secrets.
 """
 
@@ -31,36 +32,12 @@ def get_conn():
     return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
 def run_query(query, params=None, fetch=True):
-    """Run SQL safely and return pandas DataFrame."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params or ())
             if fetch:
                 rows = cur.fetchall()
                 return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-# ---------------- AUTH ----------------
-def authenticate(email, pwd):
-    q = "SELECT * FROM users WHERE email=%s AND password=%s"
-    df = run_query(q, (email, pwd))
-    return df.iloc[0].to_dict() if not df.empty else None
-
-def create_account(name, email, password, role, company):
-    q = """INSERT INTO users(name,email,password,role,company_name)
-           VALUES(%s,%s,%s,%s,%s)
-           ON CONFLICT (email) DO NOTHING RETURNING id"""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(q, (name, email, password, role, company))
-            row = cur.fetchone()
-            conn.commit()
-            return row["id"] if row else None
-
-def logout():
-    for k in ["user", "role"]:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.rerun()
 
 # ---------------- UTILITIES ----------------
 def clean_company(name: str) -> str:
@@ -81,15 +58,43 @@ def is_multiple_of(step: float, diff: float, tol=1e-9) -> bool:
     ratio = diff / step
     return abs(round(ratio) - ratio) < tol
 
+# ---------------- AUTH ----------------
+def authenticate(email, pwd):
+    q = "SELECT * FROM users WHERE email=%s AND password=%s"
+    df = run_query(q, (email, pwd))
+    return df.iloc[0].to_dict() if not df.empty else None
+
+def create_account(name, email, password, role, company):
+    q = """INSERT INTO users(name,email,password,role,company_name)
+           VALUES(%s,%s,%s,%s,%s)
+           ON CONFLICT (email) DO NOTHING RETURNING id"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (name, email, password, role, company))
+            row = cur.fetchone()
+            conn.commit()
+            return row["id"] if row else None
+
+def logout():
+    for k in ["user", "role"]:
+        st.session_state.pop(k, None)
+    st.rerun()
+
+# ---------------- AUTO-CLOSE EXPIRED AUCTIONS ----------------
+def auto_close_expired():
+    q = "UPDATE auctions SET status='closed' WHERE status='live' AND end_time <= (NOW() AT TIME ZONE 'UTC')"
+    run_query(q, fetch=False)
+
 # ---------------- BUYER DASHBOARD ----------------
 def buyer_dashboard(user):
+    auto_close_expired()  # housekeeping on load
     company_clean = clean_company(user.get("company_name", ""))
     st.title("👩‍💼 Buyer Dashboard")
     st.markdown(f"**Welcome, {user['name']}** ({company_clean})")
 
     tabs = st.tabs(["🧾 Auctions", "📦 Create Auction", "📊 View Bids"])
 
-    # ---------- My Auctions ----------
+    # ---------- Auctions Tab ----------
     with tabs[0]:
         st.subheader("Your Auctions")
         q = """
@@ -113,48 +118,53 @@ def buyer_dashboard(user):
             st.dataframe(df, use_container_width=True)
 
         st.markdown("### Manage Auction Status")
-        aucs = run_query("SELECT id,title,status FROM auctions WHERE created_by=%s", (user["id"],))
+        aucs = run_query("SELECT id,title,status,end_time FROM auctions WHERE created_by=%s", (user["id"],))
         if not aucs.empty:
             sel = st.selectbox(
-                "Select Auction",
+                "Select Auction to Manage",
                 aucs["id"],
                 format_func=lambda x: f"{x} - {aucs.loc[aucs['id']==x,'title'].iloc[0]}",
+                key="manage_select"
             )
-            status = aucs.loc[aucs["id"] == sel, "status"].iloc[0]
-            st.write(f"Current status: **{status}**")
+            row = aucs.loc[aucs["id"] == sel].iloc[0]
+            status = row["status"]
+            st.write(f"**Current Status:** {status}")
 
-            duration = st.number_input("Auction Duration (minutes)", min_value=1, value=10)
+            # Allow start/close only if not already live/closed
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("▶️ Start Auction"):
+                if status == "scheduled" and st.button("▶️ Start Auction Now", key=f"start_{sel}"):
                     q = """
                     UPDATE auctions
                     SET status='live',
                         start_time=NOW(),
-                        end_time=NOW() + make_interval(mins := %s)
+                        end_time=NOW() + make_interval(mins := 10)
                     WHERE id=%s RETURNING id;
                     """
-                    res = run_query(q, (duration, sel))
+                    res = run_query(q, (sel,))
                     if res.empty:
                         st.error("Failed to start auction.")
                     else:
-                        st.success("Auction started successfully.")
+                        st.success("Auction started for 10 minutes.")
                         st.experimental_rerun()
             with col2:
-                if st.button("⏹️ Close Auction"):
+                if status == "live" and st.button("⏹️ Close Auction", key=f"close_{sel}"):
                     run_query("UPDATE auctions SET status='closed' WHERE id=%s", (sel,), fetch=False)
-                    st.warning("Auction closed.")
+                    st.warning("Auction closed manually.")
                     st.experimental_rerun()
+            if status == "live":
+                end = row["end_time"]
+                st.info(f"⏳ This auction will auto-close at: **{end}**")
 
     # ---------- Create Auction ----------
     with tabs[1]:
         st.subheader("Create New Auction")
-        title = st.text_input("Auction Title")
-        desc = st.text_area("Description")
-        currency = st.selectbox("Currency", ["INR", "USD", "EUR"])
-        duration = st.number_input("Default Duration (minutes)", min_value=1, value=10)
-        min_dec = st.number_input("Minimum Bid Decrement (X)", min_value=0.0, value=0.0)
-        if st.button("Create Auction"):
+        title = st.text_input("Auction Title", key="new_title")
+        desc = st.text_area("Description", key="new_desc")
+        currency = st.selectbox("Currency", ["INR", "USD", "EUR"], key="new_curr")
+        duration = st.number_input("Default Duration (minutes)", min_value=1, max_value=1440, value=10, key="new_dur")
+        min_dec = st.number_input("Minimum Bid Decrement (X)", min_value=0.0, value=0.0, key="new_dec")
+        if st.button("Create Auction", key="create_btn"):
             q = """
             INSERT INTO auctions(title,description,currency,status,created_by,start_time,end_time,min_decrement)
             VALUES(%s,%s,%s,'scheduled',%s,NOW(),NOW() + make_interval(mins := %s),%s)
@@ -164,39 +174,43 @@ def buyer_dashboard(user):
             if df.empty:
                 st.error("Failed to create auction.")
             else:
-                st.success(f"Auction created with ID {df.iloc[0]['id']}")
+                st.success(f"Auction created with ID {df.iloc[0]['id']}. Add items below.")
                 st.experimental_rerun()
 
         st.markdown("### Add Items")
-        aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
-        if not aucs.empty:
+        aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s AND status='scheduled'", (user["id"],))
+        if aucs.empty:
+            st.info("Only scheduled auctions can accept new items.")
+        else:
             sel = st.selectbox(
-                "Select Auction to Add Items",
+                "Select Auction",
                 aucs["id"],
                 format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+                key="add_select"
             )
-            iname = st.text_input("Item Name")
-            idesc = st.text_input("Description")
-            qty = st.number_input("Quantity", min_value=1.0)
-            uom = st.text_input("UOM", "Nos")
-            base = st.number_input("Base Price", min_value=0.0)
-            if st.button("Add Item"):
+            iname = st.text_input("Item Name", key="itm_name")
+            idesc = st.text_input("Description", key="itm_desc")
+            qty = st.number_input("Quantity", min_value=1.0, key="itm_qty")
+            uom = st.text_input("UOM", "Nos", key="itm_uom")
+            base = st.number_input("Base Price", min_value=0.0, key="itm_base")
+            if st.button("Add Item", key="add_btn"):
                 q = """INSERT INTO auction_items(auction_id,item_name,description,quantity,uom,base_price)
                        VALUES(%s,%s,%s,%s,%s,%s)"""
                 run_query(q, (sel, iname, idesc, qty, uom, base), fetch=False)
-                st.success("Item added successfully.")
+                st.success("Item added successfully!")
 
-    # ---------- View Bids (Live Refresh) ----------
+    # ---------- Live Bid View ----------
     with tabs[2]:
-        st.subheader("📊 Live Bid Updates")
+        st.subheader("📊 Live Bids")
         aucs = run_query("SELECT id,title FROM auctions WHERE created_by=%s", (user["id"],))
         if aucs.empty:
             st.info("No auctions found.")
         else:
             sel = st.selectbox(
-                "Select Auction to View Bids",
+                "Select Auction",
                 aucs["id"],
                 format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+                key="bid_select"
             )
             q = """
             SELECT ai.item_name, ai.quantity, ai.uom,
@@ -207,7 +221,6 @@ def buyer_dashboard(user):
             WHERE b.auction_id=%s
             ORDER BY ai.id, b.bid_amount ASC;
             """
-            st.markdown("🔄 Auto-refresh every 3s")
             placeholder = st.empty()
             for _ in range(200):
                 df = run_query(q, (sel,))
@@ -221,9 +234,11 @@ def buyer_dashboard(user):
 
 # ---------------- SUPPLIER DASHBOARD ----------------
 def supplier_dashboard(user):
+    auto_close_expired()
     company_clean = clean_company(user.get("company_name", ""))
     st.title("🏭 Supplier Dashboard")
     st.markdown(f"**Welcome, {company_clean}**")
+
     tabs = st.tabs(["🔎 Live Auctions", "💰 Place Bids"])
 
     # ---------- Live Auctions ----------
@@ -257,18 +272,17 @@ def supplier_dashboard(user):
             st.info("No active auctions.")
             return
         sel = st.selectbox(
-            "Select Auction to Bid",
+            "Select Auction",
             aucs["id"],
             format_func=lambda x: aucs.loc[aucs['id']==x,'title'].iloc[0],
+            key="sup_bid_select"
         )
 
-        # Load min decrement
         dec_df = run_query("SELECT COALESCE(min_decrement,0) AS min_dec FROM auctions WHERE id=%s", (sel,))
         min_dec = float(dec_df.iloc[0]["min_dec"]) if not dec_df.empty else 0.0
         if min_dec:
             st.info(f"Minimum bid decrement: {min_dec}")
 
-        # Fetch auction items with lowest bids
         q_items = """
         SELECT ai.id, ai.item_name, ai.quantity, ai.uom, ai.base_price,
                v.lowest_bid
@@ -282,10 +296,9 @@ def supplier_dashboard(user):
             st.info("No items found.")
             return
 
-        st.markdown("### Enter Your Bids (edit only 'Your Bid' & select rows to submit)")
+        st.markdown("### Enter Your Bids (edit & select items to submit)")
         if "bulk_edits" not in st.session_state:
             st.session_state["bulk_edits"] = {}
-
         edits = st.session_state["bulk_edits"].get(sel, {})
         df["your_bid"] = [edits.get(iid, {}).get("your_bid", None) for iid in df["id"]]
         df["select"] = [edits.get(iid, {}).get("select", False) for iid in df["id"]]
@@ -299,7 +312,7 @@ def supplier_dashboard(user):
                 "uom": st.column_config.TextColumn("UOM", disabled=True),
                 "base_price": st.column_config.NumberColumn("Base", disabled=True),
                 "lowest_bid": st.column_config.NumberColumn("Lowest", disabled=True),
-                "your_bid": st.column_config.NumberColumn("Your Bid", help="Enter your bid amount"),
+                "your_bid": st.column_config.NumberColumn("Your Bid"),
                 "select": st.column_config.CheckboxColumn("Select"),
             },
             use_container_width=True,
@@ -317,18 +330,16 @@ def supplier_dashboard(user):
             }
         st.session_state["bulk_edits"][sel] = new_edits
 
-        if st.button("Submit Selected Bids"):
+        if st.button("Submit Selected Bids", key=f"submit_{sel}"):
             bids = []
             for iid, d in new_edits.items():
                 if not d["select"] or d["your_bid"] is None:
                     continue
                 your_bid = d["your_bid"]
-                # get current lowest
                 low_df = run_query("SELECT MIN(bid_amount) as lowest FROM bids WHERE item_id=%s", (iid,))
                 lowest = float(low_df.iloc[0]["lowest"]) if not low_df.empty and low_df.iloc[0]["lowest"] else None
                 base_df = run_query("SELECT base_price FROM auction_items WHERE id=%s", (iid,))
                 base_price = float(base_df.iloc[0]["base_price"]) if not base_df.empty else 0.0
-
                 if lowest:
                     if your_bid >= lowest:
                         st.error(f"Item {iid}: must be lower than current lowest ({lowest})")
@@ -340,9 +351,7 @@ def supplier_dashboard(user):
                     if your_bid >= base_price:
                         st.error(f"Item {iid}: first bid must be below base ({base_price})")
                         continue
-
                 bids.append((sel, iid, user["id"], your_bid))
-
             if bids:
                 try:
                     with get_conn() as conn:
@@ -366,9 +375,9 @@ st.set_page_config(page_title="Reverse Auction Platform", layout="wide")
 if "user" not in st.session_state:
     tab1, tab2 = st.tabs(["🔐 Login", "🆕 Sign Up"])
     with tab1:
-        email = st.text_input("Email")
-        pwd = st.text_input("Password", type="password")
-        if st.button("Login"):
+        email = st.text_input("Email", key="login_email")
+        pwd = st.text_input("Password", type="password", key="login_pwd")
+        if st.button("Login", key="login_btn"):
             u = authenticate(email, pwd)
             if not u:
                 st.error("Invalid credentials.")
@@ -377,12 +386,12 @@ if "user" not in st.session_state:
                 st.session_state["role"] = u["role"]
                 st.experimental_rerun()
     with tab2:
-        name = st.text_input("Full Name")
-        email = st.text_input("Email Address")
-        pwd = st.text_input("Password", type="password")
-        role = st.selectbox("Role", ["buyer", "supplier"])
-        company = st.text_input("Company Name")
-        if st.button("Create Account"):
+        name = st.text_input("Full Name", key="signup_name")
+        email = st.text_input("Email Address", key="signup_email")
+        pwd = st.text_input("Password", type="password", key="signup_pwd")
+        role = st.selectbox("Role", ["buyer", "supplier"], key="signup_role")
+        company = st.text_input("Company Name", key="signup_company")
+        if st.button("Create Account", key="signup_btn"):
             uid = create_account(name, email, pwd, role, company)
             if uid:
                 st.success("Account created. Please login.")
@@ -391,7 +400,7 @@ if "user" not in st.session_state:
 else:
     user = st.session_state["user"]
     st.sidebar.success(f"Logged in as {user['name']} ({user['role']})")
-    if st.sidebar.button("Logout"):
+    if st.sidebar.button("Logout", key="logout_btn"):
         logout()
     if user["role"] == "buyer":
         buyer_dashboard(user)
