@@ -7,6 +7,7 @@ Streamlit + Neon PostgreSQL
 ✅ Auto-close expired auctions
 ✅ Live updates without logout
 ✅ Buyer-only PDF Summary Report
+✅ Fixed supplier live auction visibility
 Requires NEON_URL in secrets.
 """
 
@@ -82,7 +83,7 @@ def logout():
 
 # ---------------- AUTO-CLOSE EXPIRED AUCTIONS ----------------
 def auto_close_expired():
-    q = "UPDATE auctions SET status='closed' WHERE status='live' AND end_time <= (NOW() AT TIME ZONE 'UTC')"
+    q = "UPDATE auctions SET status='closed' WHERE status='live' AND end_time <= NOW()"
     run_query(q, fetch=False)
 
 # ---------------- BUYER DASHBOARD ----------------
@@ -274,7 +275,6 @@ def buyer_dashboard(user):
             pdf.ln(5)
             pdf.set_font("Arial", "", 11)
             pdf.cell(0, 10, f"Generated on {timestamp}", ln=True)
-
             pdf.set_font("Arial", "B", 12)
             pdf.cell(60, 10, "Item", 1)
             pdf.cell(25, 10, "Qty", 1)
@@ -282,7 +282,6 @@ def buyer_dashboard(user):
             pdf.cell(30, 10, "Lowest Bid", 1)
             pdf.cell(55, 10, "Winner", 1)
             pdf.ln()
-
             pdf.set_font("Arial", "", 11)
             for _, r in df.iterrows():
                 pdf.cell(60, 10, str(r["item_name"]), 1)
@@ -291,7 +290,6 @@ def buyer_dashboard(user):
                 pdf.cell(30, 10, str(r["lowest_bid"]), 1)
                 pdf.cell(55, 10, str(r["winner"]), 1)
                 pdf.ln()
-
             pdf_output = f"auction_summary_{sel}.pdf"
             pdf.output(pdf_output)
             with open(pdf_output, "rb") as f:
@@ -312,12 +310,12 @@ def supplier_dashboard(user):
         placeholder = st.empty()
         for _ in range(200):
             q = """
-            SELECT a.id,a.title,a.currency,a.end_time,COUNT(ai.id) AS items
+            SELECT a.id, a.title, a.currency, a.end_time, COUNT(ai.id) AS items
             FROM auctions a
-            JOIN auction_items ai ON a.id=ai.auction_id
-            WHERE a.status='live'
-              AND a.end_time > (NOW() AT TIME ZONE 'UTC' - INTERVAL '1 minute')
-            GROUP BY a.id,a.title,a.currency,a.end_time
+            JOIN auction_items ai ON a.id = ai.auction_id
+            WHERE a.status = 'live'
+              AND a.end_time > NOW() - INTERVAL '1 minute'
+            GROUP BY a.id, a.title, a.currency, a.end_time
             ORDER BY a.id;
             """
             df = run_query(q)
@@ -333,19 +331,17 @@ def supplier_dashboard(user):
     # ---------- Place Bids ----------
     with tabs[1]:
         st.subheader("Place Your Bids")
-
         aucs = run_query("""
             SELECT a.id, a.title
             FROM auctions a
-            WHERE a.status='live'
-              AND a.end_time > (NOW() AT TIME ZONE 'UTC' - INTERVAL '1 minute')
+            WHERE a.status = 'live'
+              AND a.end_time > NOW() - INTERVAL '1 minute'
             ORDER BY a.id;
         """)
-
         if aucs.empty:
             st.warning("No active auctions available for bidding.")
             dbg = run_query("""
-                SELECT id, title, status, end_time, NOW() AT TIME ZONE 'UTC' AS server_time
+                SELECT id, title, status, end_time, NOW() AS server_time
                 FROM auctions ORDER BY id DESC LIMIT 5;
             """)
             st.caption("🔍 Debug view of last 5 auctions:")
@@ -368,13 +364,13 @@ def supplier_dashboard(user):
         SELECT ai.id, ai.item_name, ai.quantity, ai.uom, ai.base_price,
                v.lowest_bid
         FROM auction_items ai
-        LEFT JOIN v_lowest_bids_per_item v ON ai.id=v.item_id
-        WHERE ai.auction_id=%s
+        LEFT JOIN v_lowest_bids_per_item v ON ai.id = v.item_id
+        WHERE ai.auction_id = %s
         ORDER BY ai.id;
         """
         df = run_query(q_items, (sel,))
         if df.empty:
-            st.info("No items found.")
+            st.info("No items found in this auction.")
             return
 
         st.markdown("### Enter Your Bids (edit & select items to submit)")
